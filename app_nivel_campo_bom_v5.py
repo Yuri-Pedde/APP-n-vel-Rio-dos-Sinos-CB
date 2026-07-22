@@ -1,28 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-NÍVEL DOS SINOS — CAMPO BOM (Estação ANA 87380000) — v5
+NÍVEL DOS SINOS — CAMPO BOM (Estação ANA 87380000) — v7
 ==============================================================================
-Novidades da v4 (sobre a v3):
-  - PDF totalmente redesenhado: faixa de cabeçalho, selo de status colorido,
-    KPIs em cards arredondados, mini-cards da previsão de 7 dias.
-  - O gráfico do PDF agora é desenhado com MATPLOTLIB (já vem no Colab).
-    Não precisa mais de kaleido nem de Chrome — funciona sempre.
+Novidades da v7 (sobre a v6):
+  - Layout ainda mais largo (1750px).
+  - Datas dos avisos do INMET em formato brasileiro legível
+    (ex.: "22/07/2026" em vez de "2026-07-22T00:00:00.000Z").
+    Se início e fim caírem no mesmo instante, mostra a data só uma vez.
+  - MODO CLARO / MODO ESCURO com botão no canto superior direito.
+    A preferência fica salva no navegador (localStorage) e o gráfico
+    também troca de tema junto.
 
 Fontes de dados:
   - Nível/chuva/vazão: API HidroWebService da ANA (estação 87380000)
   - Meteorologia: Open-Meteo (https://open-meteo.com) — gratuita, sem chave
+  - Avisos meteorológicos: INMET (https://alertas.inmet.gov.br)
 
 Cada bloco "# ===== CÉLULA N =====" pode virar uma célula no Colab.
-No VS Code: python app_nivel_campo_bom_v4.py
-Para hospedar (Render etc.): gunicorn app_nivel_campo_bom_v4:server
+No VS Code: python app_nivel_campo_bom_v7.py
+Para hospedar (Render etc.): gunicorn app_nivel_campo_bom_v7:server
 """
 
 # ============================================================
 # ===== CÉLULA 1 — Instalação (rodar só uma vez no Colab) =====
 # ============================================================
 # !pip install dash dash-bootstrap-components plotly pandas requests
-# !pip install fpdf2 matplotlib   # <- para o Exportar PDF (kaleido NÃO é mais necessário)
-
+# !pip install fpdf2 matplotlib   # <- para o Exportar PDF
 
 # ============================================================
 # ===== CÉLULA 2 — Imports e configurações ===================
@@ -76,7 +79,13 @@ URL_METEO = (
     "&current_weather=true&timezone=America%2FSao_Paulo&forecast_days=7"
 )
 
+# ---- INMET (avisos meteorológicos oficiais) ----
+GEOCODIGO_IBGE = "4303905"          # Campo Bom/RS
+URL_ALERTAS_INMET = "https://apiprevmet3.inmet.gov.br/avisos/ativos"
+
 DIAS_PT = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+
+LARGURA_MAX = "1750px"   # <- largura do painel (era 1400px na v6)
 
 
 # ============================================================
@@ -197,6 +206,46 @@ def buscar_meteo():
         return None
 
 
+def buscar_alertas_inmet():
+    """Avisos meteorológicos oficiais do INMET vigentes para Campo Bom.
+    Retorna: lista de avisos (pode ser vazia) ou None se a consulta falhar."""
+    try:
+        r = requests.get(URL_ALERTAS_INMET, timeout=30,
+                         headers={"User-Agent": "Mozilla/5.0 (nivel-sinos)"})
+        r.raise_for_status()
+        dados = r.json()
+    except Exception as e:
+        print("INMET indisponível:", e)
+        return None
+
+    if isinstance(dados, dict):
+        avisos = list(dados.get("hoje") or []) + list(dados.get("futuro") or [])
+    elif isinstance(dados, list):
+        avisos = dados
+    else:
+        avisos = []
+
+    achados = []
+    for av in avisos:
+        if not isinstance(av, dict):
+            continue
+        blob = " ".join(str(av.get(campo, "")) for campo in
+                        ("geocodes", "municipios", "municipio", "cidades"))
+        if GEOCODIGO_IBGE in blob or "Campo Bom" in blob:
+            riscos = av.get("riscos") or av.get("descricao_riscos") or ""
+            if isinstance(riscos, (list, tuple)):
+                riscos = "; ".join(str(x) for x in riscos)
+            achados.append({
+                "evento": (av.get("descricao") or av.get("evento")
+                           or "Aviso meteorológico"),
+                "severidade": str(av.get("severidade") or ""),
+                "inicio": str(av.get("data_inicio") or ""),
+                "fim": str(av.get("data_fim") or ""),
+                "riscos": str(riscos),
+            })
+    return achados
+
+
 def carregar_dados():
     identificador, senha = ler_credenciais()
     token = gerar_token(identificador, senha)
@@ -205,7 +254,7 @@ def carregar_dados():
     except PermissionError:
         token = gerar_token(identificador, senha, forcar=True)
         items = buscar_serie(token)
-    return processar_dados(items), buscar_meteo()
+    return processar_dados(items), buscar_meteo(), buscar_alertas_inmet()
 
 
 # ============================================================
@@ -285,6 +334,42 @@ def fmt(v, casas=2):
     return f"{v:.{casas}f}" if v is not None and pd.notna(v) else "—"
 
 
+def formatar_data_aviso(valor):
+    """Converte as datas do INMET para formato brasileiro legível.
+
+    Aceita tanto ISO com 'Z' ('2026-07-22T00:00:00.000Z') quanto
+    '2026-07-22 10:00:00'. Removemos o 'Z' de propósito (sem converter
+    fuso), porque nesses avisos o horário costuma vir zerado e o que
+    interessa é a DATA — converter UTC->BRT jogaria a data um dia
+    para trás. Se o horário for meia-noite, mostra só a data.
+    """
+    s = str(valor or "").strip()
+    if not s or s.lower() in ("none", "nan"):
+        return "?"
+    try:
+        ts = pd.to_datetime(s.replace("Z", "").replace("z", ""))
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        if ts.hour == 0 and ts.minute == 0:
+            return ts.strftime("%d/%m/%Y")
+        return ts.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return s   # se não der para interpretar, mostra como veio
+
+
+def texto_vigencia(inicio, fim):
+    """'Vigência: 22/07/2026 até 24/07/2026' — ou só uma data se forem iguais."""
+    ini_f = formatar_data_aviso(inicio)
+    fim_f = formatar_data_aviso(fim)
+    if ini_f == "?" and fim_f == "?":
+        return None
+    if ini_f == fim_f or fim_f == "?":
+        return f"Vigência: {ini_f}"
+    if ini_f == "?":
+        return f"Vigência: até {fim_f}"
+    return f"Vigência: {ini_f} até {fim_f}"
+
+
 # ============================================================
 # ===== CÉLULA 5C — DIAGNÓSTICO ==============================
 # ============================================================
@@ -298,40 +383,56 @@ def diagnostico():
     print(f"{len(df)} registros | última: {df['data_hora'].iloc[-1] if not df.empty else '—'}")
     meteo = buscar_meteo()
     print("open-meteo:", "ok" if meteo else "falhou")
+    alertas = buscar_alertas_inmet()
+    if alertas is None:
+        print("inmet: falhou")
+    else:
+        print(f"inmet: ok ({len(alertas)} aviso(s) para {NOME_ESTACAO})")
+        for a in (alertas or []):
+            print("  vigência formatada:", texto_vigencia(a["inicio"], a["fim"]))
     return df
 
 
 # ============================================================
-# ===== CÉLULA 5D — Gráficos (tela e PDF) ====================
+# ===== CÉLULA 5D — Temas e gráficos (tela e PDF) ============
 # ============================================================
-COR_FUNDO = "#0b1220"
-COR_CARD = "#141d33"
-COR_CARD2 = "#1a2542"
-COR_TEXTO = "#e6edf3"
-COR_AGUA = "#38bdf8"
-COR_CHUVA = "#60a5fa"
+# Paletas do gráfico Plotly (a interface usa variáveis CSS; o Plotly
+# não entende CSS vars, então a figura recebe o tema por parâmetro).
+TEMAS_FIG = {
+    "dark": dict(template="plotly_dark",
+                 paper="#141d33", plot="#141d33", texto="#e6edf3",
+                 agua="#38bdf8", chuva="#60a5fa",
+                 fill="rgba(56,189,248,.12)",
+                 atencao="#facc15", alerta="#fb923c", inund="#ef4444"),
+    "light": dict(template="plotly_white",
+                  paper="#ffffff", plot="#ffffff", texto="#0f172a",
+                  agua="#0284c7", chuva="#3b82f6",
+                  fill="rgba(2,132,199,.10)",
+                  atencao="#b45309", alerta="#c2410c", inund="#b91c1c"),
+}
 
 RANGES = {"24h": 1, "3 dias": 3, "7 dias": 7, "15 dias": 15, "30 dias": 30}
 
 
-def montar_figura(dfr):
+def montar_figura(dfr, tema="dark"):
     """Gráfico combinado chuva+nível (Plotly) usado na TELA do app."""
+    t = TEMAS_FIG.get(tema, TEMAS_FIG["dark"])
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Bar(
         x=dfr["data_hora"], y=dfr["chuva_mm"], name="Chuva (mm)",
-        marker_color=COR_CHUVA, opacity=.55,
+        marker_color=t["chuva"], opacity=.55,
         hovertemplate="%{x|%d/%m %H:%M}<br>%{y:.1f} mm<extra>Chuva</extra>",
     ), secondary_y=True)
     fig.add_trace(go.Scatter(
         x=dfr["data_hora"], y=dfr["cota_m"], name="Nível (m)",
-        mode="lines", line=dict(color=COR_AGUA, width=2.5),
-        fill="tozeroy", fillcolor="rgba(56,189,248,.12)",
+        mode="lines", line=dict(color=t["agua"], width=2.5),
+        fill="tozeroy", fillcolor=t["fill"],
         hovertemplate="%{x|%d/%m %H:%M}<br>%{y:.2f} m<extra>Nível</extra>",
     ), secondary_y=False)
 
-    for valor, texto, cor in [(COTA_ATENCAO, "Atenção", "#facc15"),
-                              (COTA_ALERTA, "Alerta", "#fb923c"),
-                              (COTA_INUNDACAO, "Inundação", "#ef4444")]:
+    for valor, texto, cor in [(COTA_ATENCAO, "Atenção", t["atencao"]),
+                              (COTA_ALERTA, "Alerta", t["alerta"]),
+                              (COTA_INUNDACAO, "Inundação", t["inund"])]:
         if valor is not None:
             fig.add_hline(y=valor, line_dash="dash", line_color=cor,
                           annotation_text=f"{texto} ({valor:.2f} m)",
@@ -339,7 +440,8 @@ def montar_figura(dfr):
                           annotation_font_color=cor, secondary_y=False)
 
     fig.update_layout(
-        template="plotly_dark", paper_bgcolor=COR_CARD, plot_bgcolor=COR_CARD,
+        template=t["template"], paper_bgcolor=t["paper"], plot_bgcolor=t["plot"],
+        font=dict(color=t["texto"]),
         height=440, margin=dict(l=45, r=45, t=30, b=40),
         hovermode="x unified", barmode="overlay",
         legend=dict(orientation="h", y=1.08, x=0),
@@ -350,9 +452,16 @@ def montar_figura(dfr):
     return fig
 
 
+def figura_vazia(tema="dark", texto="Aguardando dados..."):
+    t = TEMAS_FIG.get(tema, TEMAS_FIG["dark"])
+    return go.Figure().update_layout(
+        template=t["template"], paper_bgcolor=t["paper"], plot_bgcolor=t["plot"],
+        height=430, annotations=[dict(text=texto, showarrow=False,
+                                      font=dict(color=t["texto"], size=16))])
+
+
 def grafico_png_pdf(dfr):
-    """Mesmo gráfico, em matplotlib (tema claro), como PNG para o PDF.
-    Não depende de kaleido nem de navegador."""
+    """Mesmo gráfico, em matplotlib (tema claro), como PNG para o PDF."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -379,7 +488,7 @@ def grafico_png_pdf(dfr):
     ax.fill_between(dfr["data_hora"], dfr["cota_m"].fillna(0),
                     color="#0284c7", alpha=.08, zorder=2)
 
-    # --- cotas de referência (rótulos à esquerda, como na tela) ---
+    # --- cotas de referência ---
     trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
     for valor, texto, cor in [(COTA_ATENCAO, "Atenção", "#b45309"),
                               (COTA_ALERTA, "Alerta", "#c2410c"),
@@ -427,12 +536,11 @@ def grafico_png_pdf(dfr):
 # ============================================================
 # ===== CÉLULA 5E — Geração do PDF ===========================
 # ============================================================
-# Paleta do PDF (RGB, impressão em fundo claro)
-PDF_AZUL_ESCURO = (13, 27, 62)     # faixa do cabeçalho
-PDF_AZUL = (2, 132, 199)           # número do nível
+PDF_AZUL_ESCURO = (13, 27, 62)
+PDF_AZUL = (2, 132, 199)
 PDF_TEXTO = (15, 23, 42)
 PDF_CINZA = (100, 116, 139)
-PDF_CARD = (241, 245, 249)         # fundo dos cards
+PDF_CARD = (241, 245, 249)
 PDF_CARD_BORDA = (226, 232, 240)
 PDF_STATUS = {"success": (34, 197, 94), "warning": (234, 179, 8),
               "danger": (239, 68, 68), "secondary": (148, 163, 184)}
@@ -477,7 +585,7 @@ def gerar_pdf_bytes(df, range_nome, meteo):
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
-    L = pdf.w - pdf.l_margin - pdf.r_margin   # largura útil (~190 mm)
+    L = pdf.w - pdf.l_margin - pdf.r_margin
     X0 = pdf.l_margin
 
     # ---------- faixa de cabeçalho ----------
@@ -505,7 +613,6 @@ def gerar_pdf_bytes(df, range_nome, meteo):
     pdf.cell(L, 13, _lat(f"{fmt(nivel)} m"), align="C",
              new_x="LMARGIN", new_y="NEXT")
 
-    # selo (pílula) colorido central
     tend = ""
     if tx1 is not None:
         rotulo = ("Subindo" if tx1 > 0.2 else
@@ -593,7 +700,6 @@ def gerar_pdf_bytes(df, range_nome, meteo):
         w = (L - gap * (n - 1)) / n
         h = 27
         y = pdf.get_y()
-        # quebra de página se não couber (cards + rodapé)
         if y + h + 20 > pdf.h - pdf.b_margin:
             pdf.add_page()
             y = pdf.get_y()
@@ -664,16 +770,82 @@ def gerar_pdf_bytes(df, range_nome, meteo):
 # ============================================================
 CENTRO = {"textAlign": "center"}
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG],
+# A interface agora usa VARIÁVEIS CSS para as cores, e o tema
+# (dark/light) é trocado adicionando data-theme="light" no <html>.
+# Assim quase nenhum componente precisa ser reconstruído na troca.
+CSS_TEMAS = """
+:root, [data-theme="dark"] {
+  --fundo: #0b1220;   --card: #141d33;  --card2: #1a2542;
+  --texto: #e6edf3;   --agua: #38bdf8;  --borda: rgba(255,255,255,.06);
+  --sombra: none;
+  --chuva-baixa: #60a5fa; --chuva-media: #facc15; --chuva-alta: #f87171;
+  --sobe: #f87171; --desce: #4ade80; --estavel: #9ca3af;
+}
+[data-theme="light"] {
+  --fundo: #eef2f7;   --card: #ffffff;  --card2: #f1f5f9;
+  --texto: #0f172a;   --agua: #0284c7;  --borda: rgba(15,23,42,.10);
+  --sombra: 0 1px 4px rgba(15,23,42,.08);
+  --chuva-baixa: #2563eb; --chuva-media: #b45309; --chuva-alta: #dc2626;
+  --sobe: #dc2626; --desce: #16a34a; --estavel: #64748b;
+}
+html, body { background-color: var(--fundo); }
+body, .accordion-body { color: var(--texto); transition: background-color .25s, color .25s; }
+/* O tema BOOTSTRAP define texto escuro dentro de .card — aqui fazemos o
+   card herdar a cor do tema atual (dinâmica), senão as letras "somem"
+   sobre o fundo escuro. Redefinir a variável --bs-card-color não afeta
+   as cores específicas (.cor-agua, alertas, taxas, chuva etc.). */
+.card { --bs-card-color: var(--texto); color: var(--texto); }
+.painel-card { background-color: var(--card) !important; border: 1px solid var(--borda) !important;
+               border-radius: 14px; box-shadow: var(--sombra); transition: background-color .25s; }
+/* Botões cinza (Modo claro / Exportar PDF) legíveis no fundo escuro */
+[data-theme="dark"] .btn-outline-secondary {
+  color: var(--texto); border-color: rgba(255,255,255,.35); }
+[data-theme="dark"] .btn-outline-secondary:hover {
+  color: #0b1220; background-color: var(--texto); }
+.painel-card2 { background-color: var(--card2) !important; }
+.cor-agua { color: var(--agua) !important; }
+.chuva-baixa { color: var(--chuva-baixa); font-weight: 600; }
+.chuva-media { color: var(--chuva-media); font-weight: 600; }
+.chuva-alta  { color: var(--chuva-alta);  font-weight: 600; }
+.taxa-sobe    { color: var(--sobe); }
+.taxa-desce   { color: var(--desce); }
+.taxa-estavel { color: var(--estavel); }
+/* Acordeão (FAQ) acompanhando o tema */
+.accordion, .accordion-item { background-color: var(--card) !important;
+                              border-color: var(--borda) !important; }
+.accordion-body { background-color: var(--card) !important; }
+.accordion-button { background-color: var(--card) !important;
+                    color: var(--texto) !important; box-shadow: none !important; }
+.accordion-button:not(.collapsed) { color: var(--agua) !important; }
+[data-theme="dark"] .accordion-button::after {
+  filter: invert(1) grayscale(100%) brightness(200%); }
+"""
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
                 title=f"Nível do {NOME_RIO} - {CIDADE}")
 server = app.server   # necessário para gunicorn/hospedagem
 
+app.index_string = f"""<!DOCTYPE html>
+<html>
+  <head>
+    {{%metas%}}
+    <title>{{%title%}}</title>
+    {{%favicon%}}
+    {{%css%}}
+    <style>{CSS_TEMAS}</style>
+  </head>
+  <body>
+    {{%app_entry%}}
+    <footer>{{%config%}}{{%scripts%}}{{%renderer%}}</footer>
+  </body>
+</html>"""
+
 
 def card(children, **kw):
-    style = {"backgroundColor": COR_CARD, "border": "none",
-             "borderRadius": "14px"}
-    style.update(kw.pop("style", {}))
-    return dbc.Card(dbc.CardBody(children), style=style, **kw)
+    classes = ("painel-card " + kw.pop("className", "")).strip()
+    style = kw.pop("style", {})
+    return dbc.Card(dbc.CardBody(children), className=classes,
+                    style=style, **kw)
 
 
 def kpi(titulo, id_valor, sufixo=""):
@@ -687,7 +859,17 @@ def kpi(titulo, id_valor, sufixo=""):
 
 
 app.layout = dbc.Container([
-    # ---------- Cabeçalho (centralizado) ----------
+    # ---------- Tema: preferência salva no navegador + aplicador ----------
+    dcc.Store(id="tema-sel", data="dark", storage_type="local"),
+    html.Div(id="tema-dummy", style={"display": "none"}),
+
+    # ---------- Botão de tema (canto superior direito) ----------
+    html.Div(
+        dbc.Button(id="btn-tema", size="sm", outline=True, color="secondary"),
+        style={"position": "absolute", "top": "14px", "right": "18px",
+               "zIndex": 10}),
+
+    # ---------- Cabeçalho ----------
     html.Div([
         html.H2(f"Nível do {NOME_RIO} - {CIDADE}",
                 style={"marginBottom": 0, "fontWeight": 800}),
@@ -698,15 +880,17 @@ app.layout = dbc.Container([
 
     html.Div(id="banner-erro"),
 
-    # ---------- Destaque: nível + status (centralizado) ----------
+    # ---------- Avisos meteorológicos (INMET) ----------
+    html.Div(id="alertas-inmet"),
+
+    # ---------- Destaque: nível + status ----------
     card([
         dbc.Row([
             dbc.Col([
                 html.Div("Nível atual", style={"opacity": .65}),
                 html.Div([
-                    html.Span(id="hero-nivel",
-                              style={"fontSize": "3.4rem", "fontWeight": 800,
-                                     "color": COR_AGUA}),
+                    html.Span(id="hero-nivel", className="cor-agua",
+                              style={"fontSize": "3.4rem", "fontWeight": 800}),
                     html.Span(" m", style={"fontSize": "1.4rem", "opacity": .6}),
                 ]),
                 html.Div(id="hero-atualizado", style={"opacity": .6,
@@ -720,7 +904,7 @@ app.layout = dbc.Container([
                 className="d-flex flex-column justify-content-center "
                           "align-items-center", style=CENTRO),
         ]),
-    ], style={"backgroundColor": COR_CARD2}),
+    ], className="painel-card2"),
 
     html.Div(style={"height": ".6rem"}),
 
@@ -735,7 +919,7 @@ app.layout = dbc.Container([
 
     html.Div(style={"height": ".6rem"}),
 
-    # ---------- Tendências (centralizado) ----------
+    # ---------- Tendências ----------
     card([
         html.Div("Variação média do nível",
                  style={"fontWeight": 700, "marginBottom": ".4rem", **CENTRO}),
@@ -748,7 +932,7 @@ app.layout = dbc.Container([
 
     html.Div(style={"height": ".8rem"}),
 
-    # ---------- Seletor de período (centralizado) + gráfico ----------
+    # ---------- Seletor de período + gráfico ----------
     html.Div(
         dbc.ButtonGroup(
             [dbc.Button(r, id={"type": "btn-range", "index": r},
@@ -761,7 +945,7 @@ app.layout = dbc.Container([
 
     html.Div(style={"height": "1rem"}),
 
-    # ---------- Meteorologia (títulos centralizados) ----------
+    # ---------- Meteorologia ----------
     card([
         html.Div(f"Previsão do tempo em {NOME_ESTACAO} — 7 dias",
                  style={"fontWeight": 700, "marginBottom": ".5rem", **CENTRO}),
@@ -774,21 +958,90 @@ app.layout = dbc.Container([
 
     html.Div(style={"height": "1rem"}),
 
-    # ---------- Ações (centralizadas) ----------
+    # ---------- FAQ (respostas dinâmicas) ----------
+    card([
+        html.Div("Perguntas Frequentes",
+                 style={"fontWeight": 700, "fontSize": "1.15rem",
+                        "marginBottom": ".8rem", **CENTRO}),
+        dbc.Accordion([
+            dbc.AccordionItem(
+                html.Div(id="faq-nivel"), item_id="faq-1",
+                title=f"Qual é o nível atual do {NOME_RIO} em {NOME_ESTACAO}?"),
+            dbc.AccordionItem(
+                html.Div(id="faq-chuva"), item_id="faq-2",
+                title=f"Vai chover em {NOME_ESTACAO} hoje?"),
+            dbc.AccordionItem(
+                html.Div(id="faq-enchente"), item_id="faq-3",
+                title=f"A chuva pode causar enchente em {NOME_ESTACAO}?"),
+            dbc.AccordionItem(
+                html.Div(id="faq-alerta"), item_id="faq-4",
+                title="Há algum alerta meteorológico vigente para a região?"),
+            dbc.AccordionItem(
+                html.Div([
+                    "Os dados hidrológicos vêm da telemetria da estação "
+                    f"{NOME_ESTACAO} (código {CODIGO_ESTACAO}), operada pela "
+                    "rede da Agência Nacional de Águas e Saneamento Básico "
+                    "(ANA) com o Serviço Geológico do Brasil (SGB/CPRM). "
+                    "O painel busca novos dados automaticamente a cada "
+                    "15 minutos; a estação costuma registrar leituras de "
+                    "15 em 15 minutos ou de hora em hora."
+                ]), item_id="faq-5",
+                title="Com que frequência os dados são atualizados?"),
+            dbc.AccordionItem(
+                html.Div([
+                    html.Div([html.B("Normal: "),
+                              f"abaixo da cota de atenção ({COTA_ATENCAO:.2f} m)."]),
+                    html.Div([html.B("Atenção: "),
+                              f"a partir de {COTA_ATENCAO:.2f} m — acompanhe a evolução."]),
+                    html.Div([html.B("Alerta: "),
+                              f"a partir de {COTA_ALERTA:.2f} m — o rio se aproxima "
+                              "da cota de inundação."]),
+                    html.Div([html.B("Inundação: "),
+                              f"a partir de {COTA_INUNDACAO:.2f} m — o nível "
+                              "ultrapassou a cota de inundação."]),
+                    html.Div("As cotas são valores de referência; siga sempre "
+                             "as orientações da Defesa Civil.",
+                             style={"opacity": .7, "marginTop": ".4rem",
+                                    "fontSize": ".85rem"}),
+                ]), item_id="faq-6",
+                title="O que significam os status de nível?"),
+            dbc.AccordionItem(
+                html.Div([
+                    "Sim. O gráfico interativo acima permite visualizar o "
+                    "histórico de 24 horas até 30 dias. Selecione o período "
+                    "nos botões logo acima do gráfico. Você também pode "
+                    "exportar um relatório em PDF com o botão no fim da página."
+                ]), item_id="faq-7",
+                title="Posso ver o histórico do nível?"),
+            dbc.AccordionItem(
+                html.Div([
+                    "Nível, chuva e vazão: ANA / HidroWebService (estação "
+                    f"{CODIGO_ESTACAO}). Previsão do tempo e vento: Open-Meteo. "
+                    "Avisos meteorológicos: INMET (alertas.inmet.gov.br). "
+                    "Este é um projeto informativo e experimental — em situação "
+                    "de risco, consulte a Defesa Civil (telefone 199)."
+                ]), item_id="faq-8",
+                title="De onde vêm os dados?"),
+        ], start_collapsed=True, flush=True),
+    ]),
+
+    html.Div(style={"height": "1rem"}),
+
+    # ---------- Ações ----------
     html.Div([
         dbc.Button("Atualizar agora", id="btn-atualizar", color="info",
                    className="me-2"),
         dcc.Loading(
             dbc.Button("Exportar PDF", id="btn-pdf", color="secondary",
                        outline=True),
-            type="circle", color=COR_AGUA,
+            type="circle", color="#38bdf8",
             style={"display": "inline-block"}),
         dcc.Download(id="download-pdf"),
     ], className="d-flex justify-content-center align-items-center"),
     html.Div(id="pdf-aviso", style={"fontSize": ".8rem", "opacity": .7,
                                     "marginTop": ".4rem", **CENTRO}),
 
-    # ---------- Rodapé (centralizado) ----------
+    # ---------- Rodapé ----------
     html.Hr(style={"opacity": .2, "marginTop": "1.5rem"}),
     html.Div([
         html.Div([html.B("Realização: "), REALIZACAO,
@@ -796,7 +1049,7 @@ app.layout = dbc.Container([
         html.Div(["Fonte dos dados hidrológicos: ",
                   html.A("ANA / HidroWebService",
                          href="https://www.snirh.gov.br/hidroweb-mobile/mapa/historico-estacao/87380000",
-                         target="_blank", style={"color": COR_AGUA}),
+                         target="_blank", className="cor-agua"),
                   " · Meteorologia: Open-Meteo"]),
         html.Div(f"Pico histórico de referência: {PICO_HISTORICO:.2f} m"
                  if PICO_HISTORICO else "",
@@ -810,14 +1063,43 @@ app.layout = dbc.Container([
 
     dcc.Interval(id="intervalo", interval=15 * 60 * 1000, n_intervals=0),
     dcc.Store(id="store-dados"),
-], fluid=True, style={"maxWidth": "1050px", "color": COR_TEXTO,
-                      "backgroundColor": COR_FUNDO, "minHeight": "100vh",
+], fluid=True, style={"maxWidth": LARGURA_MAX, "position": "relative",
+                      "color": "var(--texto)",
+                      "backgroundColor": "var(--fundo)", "minHeight": "100vh",
                       "paddingTop": ".2rem"})
 
 
 # ============================================================
 # ===== CÉLULA 6B — Callbacks ================================
 # ============================================================
+# --- Tema: aplica o atributo data-theme no <html> (clientside = instantâneo)
+app.clientside_callback(
+    """
+    function(tema) {
+        document.documentElement.setAttribute('data-theme', tema || 'dark');
+        return '';
+    }
+    """,
+    Output("tema-dummy", "children"),
+    Input("tema-sel", "data"),
+)
+
+
+@app.callback(
+    Output("tema-sel", "data"),
+    Input("btn-tema", "n_clicks"),
+    State("tema-sel", "data"),
+    prevent_initial_call=True,
+)
+def alternar_tema(_n, atual):
+    return "light" if atual == "dark" else "dark"
+
+
+@app.callback(Output("btn-tema", "children"), Input("tema-sel", "data"))
+def rotulo_tema(tema):
+    return "☀️ Modo claro" if tema == "dark" else "🌙 Modo escuro"
+
+
 @app.callback(
     Output("store-dados", "data"),
     Input("intervalo", "n_intervals"),
@@ -825,8 +1107,8 @@ app.layout = dbc.Container([
 )
 def atualizar_store(_i, _c):
     try:
-        df, meteo = carregar_dados()
-        return {"ok": True, "erro": None, "meteo": meteo,
+        df, meteo, alertas = carregar_dados()
+        return {"ok": True, "erro": None, "meteo": meteo, "alertas": alertas,
                 "df": df.to_json(date_format="iso", orient="split")}
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
@@ -879,12 +1161,12 @@ def linha_taxa(rotulo, taxa):
                                                  "fontSize": ".8rem"}),
                          html.Div("—", style={"fontSize": "1.2rem"})],
                         style=CENTRO)
-    seta, cor = ("▲", "#f87171") if taxa > 0.2 else \
-                (("▼", "#4ade80") if taxa < -0.2 else ("▬", "#9ca3af"))
+    seta, classe = ("▲", "taxa-sobe") if taxa > 0.2 else \
+                   (("▼", "taxa-desce") if taxa < -0.2 else ("▬", "taxa-estavel"))
     return html.Div([
         html.Div(rotulo, style={"opacity": .6, "fontSize": ".8rem"}),
-        html.Div(f"{seta} {taxa:+.1f} cm/h",
-                 style={"fontSize": "1.2rem", "fontWeight": 700, "color": cor}),
+        html.Div(f"{seta} {taxa:+.1f} cm/h", className=classe,
+                 style={"fontSize": "1.2rem", "fontWeight": 700}),
     ], style=CENTRO)
 
 
@@ -899,8 +1181,8 @@ def cartoes_meteo(meteo):
         nome = "Hoje" if i == 0 else DIAS_PT[dt.weekday()]
         chuva = d["precipitation_sum"][i]
         prob = d["precipitation_probability_max"][i]
-        cor_chuva = "#f87171" if (chuva or 0) >= 50 else \
-                    ("#facc15" if (chuva or 0) >= 20 else COR_CHUVA)
+        classe_chuva = "chuva-alta" if (chuva or 0) >= 50 else \
+                       ("chuva-media" if (chuva or 0) >= 20 else "chuva-baixa")
         cartoes.append(dbc.Col(card([
             html.Div(nome, style={"fontWeight": 700, "textAlign": "center"}),
             html.Div(f"{d['temperature_2m_max'][i]:.0f}°",
@@ -908,16 +1190,15 @@ def cartoes_meteo(meteo):
                             "textAlign": "center"}),
             html.Div(f"{d['temperature_2m_min'][i]:.0f}°",
                      style={"opacity": .6, "textAlign": "center"}),
-            html.Div(f"{chuva:.1f} mm", style={"color": cor_chuva,
-                                               "textAlign": "center",
-                                               "fontWeight": 600}),
+            html.Div(f"{chuva:.1f} mm", className=classe_chuva,
+                     style={"textAlign": "center"}),
             html.Div(f"{prob:.0f}%", style={"opacity": .6, "fontSize": ".8rem",
                                             "textAlign": "center"}),
             html.Div(f"💨 {d['windspeed_10m_max'][i]:.0f} km/h "
                      f"{direcao_pt(d['winddirection_10m_dominant'][i])}",
                      style={"opacity": .7, "fontSize": ".72rem",
                             "textAlign": "center", "marginTop": ".2rem"}),
-        ], style={"backgroundColor": COR_CARD2, "padding": "0"}),
+        ], className="painel-card2", style={"padding": "0"}),
             xs=6, md=True))
     return dbc.Row(cartoes, className="g-2")
 
@@ -930,6 +1211,138 @@ def bloco_vento(meteo):
         html.B("Vento agora: "),
         f"{cw['windspeed']:.0f} km/h, vindo de {direcao_pt(cw['winddirection'])}",
     ])
+
+
+LINK_INMET = html.A("alertas.inmet.gov.br",
+                    href="https://alertas.inmet.gov.br", target="_blank",
+                    className="cor-agua")
+
+
+def _cor_severidade(sev):
+    s = (sev or "").lower()
+    if "grande" in s or "extreme" in s:
+        return "danger"
+    if s.startswith("perigo") and "potencial" not in s or "severe" in s:
+        return "danger"
+    return "warning"          # Perigo Potencial / Moderate / desconhecido
+
+
+def bloco_alertas(alertas):
+    """Card de avisos do INMET. alertas: lista, [] (sem avisos) ou None (falha)."""
+    rodape_dc = html.Div(
+        ["Fonte: INMET (", LINK_INMET, "). Em emergência, Defesa Civil: 199."],
+        style={"opacity": .55, "fontSize": ".78rem", "marginTop": ".4rem",
+               **CENTRO})
+
+    if alertas is None:
+        corpo = html.Div(
+            ["Não foi possível consultar os avisos do INMET agora. ",
+             "Verifique diretamente em ", LINK_INMET, "."],
+            style={"opacity": .75, **CENTRO})
+        return card([corpo, rodape_dc], className="mb-2")
+
+    if not alertas:
+        corpo = dbc.Alert(
+            html.Div([html.B("Sem avisos meteorológicos vigentes "),
+                      f"do INMET para {NOME_ESTACAO} no momento."],
+                     style=CENTRO),
+            color="success", className="mb-0 py-2")
+        return card([corpo, rodape_dc], className="mb-2")
+
+    itens = []
+    for av in alertas:
+        detalhes = []
+        if av.get("severidade"):
+            detalhes.append(f"Severidade: {av['severidade']}")
+        vig = texto_vigencia(av.get("inicio"), av.get("fim"))
+        if vig:
+            detalhes.append(vig)
+        itens.append(dbc.Alert([
+            html.Div([html.B(f"⚠ {av.get('evento', 'Aviso meteorológico')}")],
+                     style=CENTRO),
+            html.Div(" · ".join(detalhes),
+                     style={"fontSize": ".85rem", **CENTRO}) if detalhes else None,
+            html.Div(av["riscos"], style={"fontSize": ".82rem", "opacity": .85,
+                                          "marginTop": ".25rem", **CENTRO})
+            if av.get("riscos") else None,
+        ], color=_cor_severidade(av.get("severidade")), className="mb-2 py-2"))
+    itens.append(rodape_dc)
+    return card(itens, className="mb-2")
+
+
+def faq_dinamico(df, meteo, alertas):
+    """Respostas dinâmicas do FAQ (nível, chuva, enchente, alerta)."""
+    aguardando = html.Div("Aguardando dados da estação...",
+                          style={"opacity": .6})
+
+    # --- nível atual ---
+    if df is None or df.empty or pd.isna(df["cota_m"].iloc[-1]):
+        r_nivel = aguardando
+        nivel = None
+    else:
+        ultimo = df.iloc[-1]
+        nivel = ultimo["cota_m"]
+        r_nivel = html.Div([
+            "A última medição registrada foi de ",
+            html.B(f"{nivel:.2f} metros"),
+            f", em {ultimo['data_hora'].strftime('%d/%m/%Y às %H:%M')}. "
+            f"A cota de inundação é de {COTA_INUNDACAO:.2f} metros. "
+            f"Os dados são da estação telemétrica da ANA "
+            f"(código {CODIGO_ESTACAO}).",
+        ])
+
+    # --- chuva prevista ---
+    if meteo and "daily" in meteo:
+        d = meteo["daily"]
+        chuva_hoje = d["precipitation_sum"][0] or 0
+        chuva_7d = sum(v or 0 for v in d["precipitation_sum"])
+        r_chuva = html.Div([
+            "A previsão indica ", html.B(f"{chuva_hoje:.1f} mm"),
+            " de chuva para hoje. Nos próximos 7 dias, são esperados ",
+            html.B(f"{chuva_7d:.1f} mm"), " acumulados. (Fonte: Open-Meteo)",
+        ])
+    else:
+        r_chuva = html.Div("Previsão indisponível no momento.",
+                           style={"opacity": .6})
+
+    # --- risco de enchente ---
+    if nivel is None:
+        r_enchente = aguardando
+    elif nivel < COTA_INUNDACAO:
+        r_enchente = html.Div([
+            f"O {NOME_RIO} está atualmente a ",
+            html.B(f"{COTA_INUNDACAO - nivel:.2f} metros"),
+            f" abaixo da cota de inundação de {COTA_INUNDACAO:.2f} metros. "
+            "Chuvas intensas na bacia hidrográfica podem elevar o nível do "
+            "rio. Acompanhe o gráfico de chuva e a tendência do nível nesta "
+            "página.",
+        ])
+    else:
+        r_enchente = html.Div([
+            f"O {NOME_RIO} ultrapassou a cota de inundação em ",
+            html.B(f"{nivel - COTA_INUNDACAO:.2f} metros"),
+            ". Siga as orientações da Defesa Civil (telefone 199).",
+        ])
+
+    # --- alertas ---
+    if alertas is None:
+        r_alerta = html.Div(["Não foi possível consultar os avisos do INMET "
+                             "agora. Verifique em ", LINK_INMET, "."])
+    elif not alertas:
+        r_alerta = html.Div([
+            "Não. No momento ", html.B("não há avisos meteorológicos"),
+            f" do INMET vigentes para {NOME_ESTACAO}. Confira também a "
+            "Defesa Civil do seu município.",
+        ])
+    else:
+        nomes = "; ".join(a.get("evento", "aviso") for a in alertas)
+        r_alerta = html.Div([
+            "Sim. Há ", html.B(f"{len(alertas)} aviso(s)"),
+            f" do INMET vigente(s) que incluem {NOME_ESTACAO}: {nomes}. "
+            "Veja os detalhes no card de avisos no topo da página.",
+        ])
+
+    return r_nivel, r_chuva, r_enchente, r_alerta
 
 
 @app.callback(
@@ -948,34 +1361,48 @@ def bloco_vento(meteo):
     Output("tx-12h", "children"),
     Output("meteo-cards", "children"),
     Output("meteo-vento", "children"),
+    Output("alertas-inmet", "children"),
+    Output("faq-nivel", "children"),
+    Output("faq-chuva", "children"),
+    Output("faq-enchente", "children"),
+    Output("faq-alerta", "children"),
     Output("banner-erro", "children"),
     Input("store-dados", "data"),
     Input("range-sel", "data"),
+    Input("tema-sel", "data"),       # <- gráfico troca de tema junto
 )
-def render(payload, range_nome):
-    vazio = go.Figure().update_layout(
-        template="plotly_dark", paper_bgcolor=COR_CARD, plot_bgcolor=COR_CARD,
-        height=430, annotations=[dict(text="Aguardando dados...",
-                                      showarrow=False,
-                                      font=dict(color=COR_TEXTO, size=16))])
-    padrao = (vazio, "—", "", "", "", f"{COTA_INUNDACAO:.2f}", "—", "—", "—",
-              "—", linha_taxa("Últimas 3h", None), linha_taxa("Últimas 6h", None),
-              linha_taxa("Últimas 12h", None), cartoes_meteo(None), None, None)
+def render(payload, range_nome, tema):
+    tema = tema or "dark"
+    vazio = figura_vazia(tema)
+
+    def saida(fig=vazio, nivel_txt="—", atualizado="", badge="", proj="",
+              media="—", minmax="—", chuva="—", vazao="—",
+              taxas=(None, None, None), meteo=None, alertas=None,
+              df=None, banner=None):
+        faq = faq_dinamico(df, meteo, alertas)
+        return (fig, nivel_txt, atualizado, badge, proj,
+                f"{COTA_INUNDACAO:.2f}", media, minmax, chuva, vazao,
+                linha_taxa("Últimas 3h", taxas[0]),
+                linha_taxa("Últimas 6h", taxas[1]),
+                linha_taxa("Últimas 12h", taxas[2]),
+                cartoes_meteo(meteo), bloco_vento(meteo),
+                bloco_alertas(alertas), *faq, banner)
 
     if not payload:
-        return padrao
+        return saida()
     if not payload.get("ok"):
         banner = dbc.Alert([html.B("Não foi possível carregar os dados. "),
                             html.Span(payload.get("erro", ""))],
                            color="danger", className="mb-3")
-        return padrao[:-1] + (banner,)
+        return saida(banner=banner)
 
     df = pd.read_json(io.StringIO(payload["df"]), orient="split")
     df["data_hora"] = pd.to_datetime(df["data_hora"], errors="coerce")
     meteo = payload.get("meteo")
+    alertas = payload.get("alertas")
 
     if df.empty:
-        return padrao[:-3] + (cartoes_meteo(meteo), bloco_vento(meteo), None)
+        return saida(meteo=meteo, alertas=alertas)
 
     # ----- números principais -----
     ultimo = df.iloc[-1]
@@ -1003,14 +1430,14 @@ def render(payload, range_nome):
     # ----- gráfico do período escolhido -----
     dias = RANGES.get(range_nome, 7)
     ini = df["data_hora"].iloc[-1] - timedelta(days=dias)
-    fig = montar_figura(df[df["data_hora"] >= ini])
+    fig = montar_figura(df[df["data_hora"] >= ini], tema)
 
-    return (fig, fmt(nivel), f"Atualizado em {quando} · {len(df)} registros/30d",
-            badge, proj, f"{COTA_INUNDACAO:.2f}", fmt(media),
-            f"{fmt(minimo)} / {fmt(maximo)}", fmt(chuva_hoje, 1), fmt(vazao, 1),
-            linha_taxa("Últimas 3h", tx3), linha_taxa("Últimas 6h", tx6),
-            linha_taxa("Últimas 12h", tx12),
-            cartoes_meteo(meteo), bloco_vento(meteo), None)
+    return saida(fig=fig, nivel_txt=fmt(nivel),
+                 atualizado=f"Atualizado em {quando} · {len(df)} registros/30d",
+                 badge=badge, proj=proj, media=fmt(media),
+                 minmax=f"{fmt(minimo)} / {fmt(maximo)}",
+                 chuva=fmt(chuva_hoje, 1), vazao=fmt(vazao, 1),
+                 taxas=(tx3, tx6, tx12), meteo=meteo, alertas=alertas, df=df)
 
 
 # ============================================================
