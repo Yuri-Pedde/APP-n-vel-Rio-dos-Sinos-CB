@@ -334,6 +334,24 @@ def fmt(v, casas=2):
     return f"{v:.{casas}f}" if v is not None and pd.notna(v) else "—"
 
 
+def resumir_erro(e):
+    """Transforma qualquer exceção numa mensagem curta e amigável.
+    Em especial, evita mostrar o código-fonte HTML das páginas de erro
+    da ANA (como no HTTP 503) na tela."""
+    import re
+    if isinstance(e, requests.exceptions.Timeout):
+        return "O servidor da ANA demorou demais para responder."
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return "Não foi possível conectar ao servidor da ANA."
+    msg = str(e)
+    if "<html" in msg.lower() or "<!doctype" in msg.lower() or "<head" in msg.lower():
+        m = re.search(r"HTTP\s*(\d{3})", msg)
+        cod = f" (HTTP {m.group(1)})" if m else ""
+        return (f"O servidor da ANA está temporariamente indisponível{cod}. "
+                "Isso costuma se resolver sozinho em alguns minutos.")
+    return f"{type(e).__name__}: {msg[:200]}"
+
+
 def formatar_data_aviso(valor):
     """Converte as datas do INMET para formato brasileiro legível.
 
@@ -819,6 +837,21 @@ body, .accordion-body { color: var(--texto); transition: background-color .25s, 
 .accordion-button:not(.collapsed) { color: var(--agua) !important; }
 [data-theme="dark"] .accordion-button::after {
   filter: invert(1) grayscale(100%) brightness(200%); }
+/* Card principal (Nível atual) muda de cor conforme o status do rio.
+   Cores fixas (não dependem do tema): amarelo/laranja/vermelho com
+   letra preta, tanto no modo claro quanto no escuro. */
+.hero-atencao   { background-color: #fbbf24 !important; }
+.hero-alerta    { background-color: #f97316 !important; }
+.hero-inundacao { background-color: #ef4444 !important; }
+.hero-atencao, .hero-alerta, .hero-inundacao {
+  border-color: rgba(0,0,0,.18) !important; }
+.hero-atencao *, .hero-alerta *, .hero-inundacao * {
+  color: #111 !important; }
+.hero-atencao .cor-agua, .hero-alerta .cor-agua,
+.hero-inundacao .cor-agua { color: #111 !important; }
+/* O selo de status vira escuro para não sumir no fundo colorido */
+.hero-atencao .badge, .hero-alerta .badge, .hero-inundacao .badge {
+  background-color: rgba(0,0,0,.78) !important; color: #fff !important; }
 """
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
@@ -904,7 +937,7 @@ app.layout = dbc.Container([
                 className="d-flex flex-column justify-content-center "
                           "align-items-center", style=CENTRO),
         ]),
-    ], className="painel-card2"),
+    ], className="painel-card2", id="hero-card"),
 
     html.Div(style={"height": ".6rem"}),
 
@@ -1104,16 +1137,25 @@ def rotulo_tema(tema):
     Output("store-dados", "data"),
     Input("intervalo", "n_intervals"),
     Input("btn-atualizar", "n_clicks"),
+    State("store-dados", "data"),
 )
-def atualizar_store(_i, _c):
+def atualizar_store(_i, _c, anterior):
     try:
         df, meteo, alertas = carregar_dados()
         return {"ok": True, "erro": None, "meteo": meteo, "alertas": alertas,
                 "df": df.to_json(date_format="iso", orient="split")}
     except Exception as e:
-        msg = f"{type(e).__name__}: {e}"
-        print("Erro ao carregar dados:", msg)
-        return {"ok": False, "erro": msg, "df": None, "meteo": None}
+        msg = resumir_erro(e)
+        print("Erro ao carregar dados:", type(e).__name__, "->", msg)
+        # Se já tínhamos dados de uma atualização anterior, NÃO apagamos
+        # o painel: mantemos os últimos dados e só avisamos da falha.
+        if anterior and anterior.get("df"):
+            anterior = dict(anterior)
+            anterior["ok"] = True
+            anterior["erro"] = msg
+            return anterior
+        return {"ok": False, "erro": msg, "df": None,
+                "meteo": None, "alertas": None}
 
 
 @app.callback(
@@ -1367,6 +1409,7 @@ def faq_dinamico(df, meteo, alertas):
     Output("faq-enchente", "children"),
     Output("faq-alerta", "children"),
     Output("banner-erro", "children"),
+    Output("hero-card", "className"),
     Input("store-dados", "data"),
     Input("range-sel", "data"),
     Input("tema-sel", "data"),       # <- gráfico troca de tema junto
@@ -1374,11 +1417,20 @@ def faq_dinamico(df, meteo, alertas):
 def render(payload, range_nome, tema):
     tema = tema or "dark"
     vazio = figura_vazia(tema)
+    HERO_BASE = "painel-card painel-card2"
+
+    def aviso_refresh():
+        return html.Div(["Atualize a página (tecla ", html.B("F5"),
+                         " ou puxe para baixo no celular) ou clique em ",
+                         html.B("\u201cAtualizar agora\u201d"),
+                         " no fim da página. O painel também tenta de novo "
+                         "sozinho a cada 15 minutos."],
+                        style={"fontSize": ".9rem", "marginTop": ".3rem"})
 
     def saida(fig=vazio, nivel_txt="—", atualizado="", badge="", proj="",
               media="—", minmax="—", chuva="—", vazao="—",
               taxas=(None, None, None), meteo=None, alertas=None,
-              df=None, banner=None):
+              df=None, banner=None, hero_cls=HERO_BASE):
         faq = faq_dinamico(df, meteo, alertas)
         return (fig, nivel_txt, atualizado, badge, proj,
                 f"{COTA_INUNDACAO:.2f}", media, minmax, chuva, vazao,
@@ -1386,14 +1438,16 @@ def render(payload, range_nome, tema):
                 linha_taxa("Últimas 6h", taxas[1]),
                 linha_taxa("Últimas 12h", taxas[2]),
                 cartoes_meteo(meteo), bloco_vento(meteo),
-                bloco_alertas(alertas), *faq, banner)
+                bloco_alertas(alertas), *faq, banner, hero_cls)
 
     if not payload:
         return saida()
     if not payload.get("ok"):
-        banner = dbc.Alert([html.B("Não foi possível carregar os dados. "),
-                            html.Span(payload.get("erro", ""))],
-                           color="danger", className="mb-3")
+        banner = dbc.Alert([
+            html.Div([html.B("Não foi possível carregar os dados. "),
+                      html.Span(payload.get("erro", ""))]),
+            aviso_refresh(),
+        ], color="danger", className="mb-3")
         return saida(banner=banner)
 
     df = pd.read_json(io.StringIO(payload["df"]), orient="split")
@@ -1432,12 +1486,30 @@ def render(payload, range_nome, tema):
     ini = df["data_hora"].iloc[-1] - timedelta(days=dias)
     fig = montar_figura(df[df["data_hora"] >= ini], tema)
 
+    # ----- cor do card principal conforme o status -----
+    classe_status = {"Atenção": "hero-atencao", "Alerta": "hero-alerta",
+                     "INUNDAÇÃO": "hero-inundacao"}.get(rot_status, "")
+    hero_cls = (HERO_BASE + " " + classe_status).strip()
+
+    # ----- banner amarelo se a ÚLTIMA atualização falhou (dados antigos) -----
+    banner = None
+    if payload.get("erro"):
+        banner = dbc.Alert([
+            html.Div([html.B("Falha na última atualização: "),
+                      html.Span(payload["erro"])]),
+            html.Div(f"Mostrando os últimos dados obtidos "
+                     f"(medição de {quando}).",
+                     style={"fontSize": ".9rem", "marginTop": ".2rem"}),
+            aviso_refresh(),
+        ], color="warning", className="mb-3")
+
     return saida(fig=fig, nivel_txt=fmt(nivel),
                  atualizado=f"Atualizado em {quando} · {len(df)} registros/30d",
                  badge=badge, proj=proj, media=fmt(media),
                  minmax=f"{fmt(minimo)} / {fmt(maximo)}",
                  chuva=fmt(chuva_hoje, 1), vazao=fmt(vazao, 1),
-                 taxas=(tx3, tx6, tx12), meteo=meteo, alertas=alertas, df=df)
+                 taxas=(tx3, tx6, tx12), meteo=meteo, alertas=alertas, df=df,
+                 banner=banner, hero_cls=hero_cls)
 
 
 # ============================================================
